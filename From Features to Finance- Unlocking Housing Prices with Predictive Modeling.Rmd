@@ -1,0 +1,197 @@
+---
+title: 'From Features to Finance: Unlocking Housing Prices with Predictive Modeling'
+author: "Hayeon Chung" 
+output: pdf_document
+date: "2025-07-23"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(caret)
+library(randomForest)
+library(xgboost)
+library(corrplot)
+library(ggplot2)
+library(data.table)
+library(recipes)
+ames <- read.csv("AmesHousing.csv")
+```
+
+# 1: Introduction 
+In the dynamic world of real estate, understanding what drives housing prices is
+essential for buyers, sellers, investors, and analysts. This project investigates 
+the Ames Housing dataset, which captures detailed records of 2,930 residential 
+homes in Ames, Iowa. Using machine learning models—including Linear Regression, 
+Random Forest, and XGBoost—we aim to uncover key predictors of housing prices 
+and develop accurate, interpretable models for price estimation.
+
+# 2: Data Cleaning & Missing Value Handling
+```{r}
+# Drop irrelevant columns
+ames <- ames %>%
+  select(-c(Order, PID))  # Identifiers with no predictive power
+
+# View missing values
+missing_summary <- colSums(is.na(ames))
+missing_summary[missing_summary > 0]
+
+# Drop columns with too many NAs or impute selectively
+drop_vars <- c("Pool.QC", "Misc.Feature", "Alley", "Fence", "Fireplace.Qu")
+ames <- ames %>% select(-one_of(drop_vars))
+
+# Impute remaining missing values (numeric with median, categorical with mode)
+for (col in names(ames)) {
+  if (any(is.na(ames[[col]]))) {
+    if (is.numeric(ames[[col]])) {
+      ames[[col]][is.na(ames[[col]])] <- median(ames[[col]], na.rm = TRUE)
+    } else {
+      ames[[col]][is.na(ames[[col]])] <- names(sort(table(ames[[col]]), decreasing = TRUE))[1]
+    }
+  }
+}
+```
+The original dataset had a range of missing values across both categorical and numerical variables. We removed five features - Pool.QC, Misc.Feature, Alley, Fence, and Fireplace.Qu - due to their extremely high missingness (>70%). 
+
+Remaining missing values were imputed as follows: Numerical variables were replaced with the median to minimize distortion from outliers. Categorical variables were replaced with the mode (most common value) to reflect typical conditions. 
+
+# 3: EDA 
+```{r}
+# Sale Price distribution
+ggplot(ames, aes(SalePrice)) +
+  geom_histogram(bins = 50, fill = "steelblue", color = "black") +
+  labs(title = "Distribution of House Sale Prices") + theme_minimal()
+
+# Correlation plot for top numeric predictors
+num_vars <- ames %>% select(where(is.numeric))
+corr_matrix <- cor(num_vars, use = "complete.obs")
+top_corr <- sort(corr_matrix[,"SalePrice"], decreasing = TRUE)[2:11]
+corrplot(cor(num_vars[, names(top_corr)], use = "complete.obs"), method = "number")
+```
+A histogram revealed that house prices (SalePrice) were right-skewed - most homes were moderately priced, but a few were extremely expensive. I also computed a correlation heatmap, which revealed strong associations between SalePrice and variables like: Overall.Qual(overall quality), Gr.Liv.Area (above-ground living space), Total.Bsmt.SF, Garage.Cars, Year.Built. In other words, the better and bigger the house, the more it sold for. That's exactly what I expected and the data confirmed it. 
+
+# 4: Feature Engineering 
+```{r}
+# Log-transform skewed target
+ames$SalePrice <- log1p(ames$SalePrice)
+
+# Convert characters to factors
+ames <- ames %>%
+  mutate(across(where(is.character), as.factor))
+```
+To improve model accuracy, I log-transformed SalePrice to reduce skewness and better satisfy linear modeling assumptions. All character-type variables were converted to factors, allowing models to treat them as categorical variables. I cleaned up how prices and labels were formatted so my models could learn patterns more easily.
+
+# 5: Train-Test Split 
+```{r}
+set.seed(123)
+train_index <- createDataPartition(ames$SalePrice, p = 0.8, list = FALSE)
+train <- ames[train_index, ]
+test <- ames[-train_index, ]
+```
+I split the dataset into 80% training and 20% testing sets. This ensures that our models are evaluated fairly on unseen data, giving me a realistic picture of how well they generalize. I taught the model using part of the data and tested it using a separate chunk to see how well it learned. 
+
+# 6: Model Training 
+
+## Linear Regression 
+```{r, warning=FALSE}
+# Fit the model
+lm_model <- train(SalePrice ~ ., data = train, method = "lm")
+
+# Extract coefficients and p-values
+coeff_table <- summary(lm_model$finalModel)$coefficients
+
+# Sort by p-value and select top N (e.g., top 15)
+top_significant <- coeff_table[coeff_table[, "Pr(>|t|)"] < 0.05, ]
+
+# Display nicely formatted table
+knitr::kable(top_significant, caption = "Statistically Significant Predictors")
+```
+The linear regression model revealed a number of statistically significant predictors of housing prices. Features such as overall quality (Overall.Qual), square footage (Gr.Liv.Area, X1st.Flr.SF, X2nd.Flr.SF), garage capacity (Garage.Cars, Garage.Area), number of full bathrooms, and the year built or remodeled all had strong positive associations with sale prices, as indicated by low p-values. Additionally, location-based factors like neighborhood played a significant role, with certain areas (e.g., StoneBr, NridgHt, Somerst) showing notably higher price effects. Conversely, many features—including Pool.Area, Mo.Sold, and several basement and exterior descriptors—were not statistically significant, suggesting they have minimal impact on price in a linear context.
+
+The model achieved an adjusted R-squared value of approximately 0.93, indicating that it explains over 90% of the variation in sale prices (on the log scale). However, several variables were excluded due to multicollinearity, pointing to overlapping information among features. While linear regression provides valuable interpretability and confirms many intuitive price drivers, it struggles with correlated predictors and complex interactions—making it less effective than nonlinear models like Random Forest or XGBoost for fine-tuned prediction.
+
+## Random Forest
+```{r}
+rf_model <- randomForest(SalePrice ~ ., data = train, ntree = 300, importance = TRUE)
+# Get variable importance and convert to dataframe
+importance_df <- as.data.frame(importance(rf_model))
+importance_df$Feature <- rownames(importance_df)
+
+# Select top 15 important features
+top_features <- importance_df %>%
+  arrange(desc(IncNodePurity)) %>%
+  slice_head(n = 15)
+
+# Plot them
+ggplot(top_features, aes(x = reorder(Feature, IncNodePurity), y = IncNodePurity)) +
+  geom_bar(stat = "identity", fill = "darkgreen") +
+  coord_flip() +
+  labs(
+    title = "Top 15 Important Features in Random Forest",
+    x = "Feature",
+    y = "Importance (IncNodePurity)"
+  ) +
+  theme_minimal(base_size = 13)  # adjust text size for readability
+```
+The Random Forest model identified Overall.Qual (overall material and finish quality) as the most influential feature in predicting housing prices, followed closely by Neighborhood and Gr.Liv.Area (above-ground living area). These findings align with real estate intuition where homes that are well-built, located in desirable areas, and offer ample living space tend to command higher prices. Additional top predictors included Exter.Qual, Year.Built, and several garage and basement-related features, highlighting the importance of both structural quality and utility space. Notably, even features like Central.Air and Garage.Yr.Blt made the top 15 list, indicating that modern amenities and recent construction add value. The consistent presence of size, quality, and location factors confirms the model’s ability to capture real-world pricing dynamics.
+
+## XGBoost
+```{r}
+# Convert data to matrix
+train_matrix <- model.matrix(SalePrice ~ . -1, data = train)
+train_label <- train$SalePrice
+test_matrix <- model.matrix(SalePrice ~ . -1, data = test)
+test_label <- test$SalePrice
+
+dtrain <- xgb.DMatrix(data = train_matrix, label = train_label)
+dtest <- xgb.DMatrix(data = test_matrix, label = test_label)
+
+xgb_model <- xgboost(data = dtrain, nrounds = 100, objective = "reg:squarederror", verbose = 0)
+```
+I trained three models of Linear Regression, Random Forest, and XGBoost. Linear Regression offers transparency and interpretability. Random Forest is an ensemble of decision trees, robust to overfitting. XGBoost is a gradient boosting model, often top-performing in competitions. Each model revealed different strengths. Linear Regression helped identify important predictors but underfit complex relationships. Random Forest and XGBoost achieved stronger predictive accuracy and handled interactions between variables effectively.  
+
+# 7: Model Evaluation 
+```{r, warning=FALSE}
+# Predict and evaluate RMSE
+pred_rf <- predict(rf_model, test)
+pred_lm <- predict(lm_model, test)
+pred_xgb <- predict(xgb_model, dtest)
+
+rmse <- function(actual, predicted) sqrt(mean((actual - predicted)^2))
+
+# Compute RMSE for all models
+rmse_rf <- rmse(test$SalePrice, pred_rf)
+rmse_lm <- rmse(test$SalePrice, pred_lm)
+rmse_xgb <- rmse(test_label, pred_xgb)
+
+# Create a comparison data frame
+model_results <- data.frame(
+  Model = c("Linear Regression", "Random Forest", "XGBoost"),
+  RMSE = c(rmse_lm, rmse_rf, rmse_xgb)
+)
+
+# Display as a nicely formatted table
+knitr::kable(model_results, caption = "Model Performance Comparison")
+```
+I used RMSE (Root Mean Squared Error) to evaluate performance. Linear Regression RMSE value was 0.171, Random Forest RMSE value was 0.122, and XGBoost RMSE value was 0.122. XGBoost slightly edged out the others in performance, but both tree-based models clearly outperformed Linear Regression. The advanced models made much better predictions than basic ones, especially when things got complicated. 
+
+# 8: Feature Importance 
+```{r}
+# From Random Forest
+importance <- importance(rf_model)
+importance_df <- data.frame(Feature = rownames(importance), Importance = importance[, 1])
+importance_df %>%
+  top_n(15, Importance) %>%
+  ggplot(aes(reorder(Feature, Importance), Importance)) +
+  geom_bar(stat = "identity", fill = "darkgreen") +
+  coord_flip() +
+  labs(title = "Top 15 Important Features in RF") + theme_minimal()
+```
+The top 5 features using Random Forest's importance metric was Gr.Liv.Area (above-ground living area), Overall.Qual (quality), Garage.Area, Total.Bsmt.SF, and Neighborhood. This aligns with real-world logic: larger, better-built homes in desirable areas fetch higher prices.   
+
+# 9: Conclusion 
+This project showcased the value of machine learning in real estate analytics. After cleaning and exploring the Ames Housing dataset, I built predictive models that captured both accuracy and interpretability. The best-performing models - Random Forest and XGBoost - achieved low prediction error and confirmed intuitive drivers of price such as square footage, quality, and neighborhood. 
+
+While the linear regression model explained a high proportion of variance in housing prices (adjusted R-squared of approximately 0.93), several variables were excluded due to multicollinearity. This issue occurs when two or more predictors are highly correlated, making it difficult to isolate their individual effects. As a result, some predictors were dropped automatically by the model due to linear dependency (noted as “aliased” coefficients). A future enhancement could involve calculating the Variance Inflation Factor (VIF) to systematically detect and manage multicollinearity for improved interpretability.
+
+Machine learning not only helps us to forecast home prices, but also confirms what really matters when buying or selling a house. 
